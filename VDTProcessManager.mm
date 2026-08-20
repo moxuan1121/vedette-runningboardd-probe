@@ -69,7 +69,7 @@ static void VDTScan(void) {
     if (!sAppTargets.count && !sDaemonTargets.count) return;
     int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
     if (bytes <= 0) { VDTArmTimer(10); return; }
-    int *pids = calloc(1, (size_t)bytes);
+    int *pids = (int *)calloc(1, (size_t)bytes);
     int count = pids ? proc_listpids(PROC_ALL_PIDS, 0, pids, bytes) : 0;
     NSMutableSet *live = [NSMutableSet set];
     BOOL foundTarget = NO;
