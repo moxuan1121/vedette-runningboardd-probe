@@ -1,0 +1,7 @@
+#!/bin/sh
+# A stable, non-jbroot location readable from a RootHide terminal.
+# Failure must not block package installation.
+mkdir -p /var/mobile/Media 2>/dev/null || true
+touch /var/mobile/Media/VDTProbe.log 2>/dev/null || true
+chmod 0644 /var/mobile/Media/VDTProbe.log 2>/dev/null || true
+exit 0

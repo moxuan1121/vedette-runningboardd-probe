@@ -7,7 +7,9 @@ It does not inject UIKit apps, SpringBoard, or ordinary daemons. It does not sca
 ## Device logs (iOS 15 RootHide)
 
 The iOS `log` utility is not macOS unified-log streaming, so this Probe also
-writes an append-only text file outside the randomized RootHide jailbreak root:
+writes an append-only text file outside the randomized RootHide jailbreak root.
+The package post-install script pre-creates this file, so its absence means the
+new package was not installed successfully:
 
 ```sh
 # Follow events live
