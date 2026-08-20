@@ -4,6 +4,7 @@
 #import <os/log.h>
 #import <roothide.h>
 #import <substrate.h>
+#import "VedetteProbeEntry.h"
 #include <stdio.h>
 
 // This probe intentionally runs only in runningboardd (also enforced by the
@@ -52,11 +53,11 @@ static NSString *VDTProbeLogPath(void) {
     return path;
 }
 
-static void VDTWriteBootstrapMarker(void) {
+static void VDTWriteLoaderEntryMarker(void) {
     @try {
         FILE *file = fopen(VDTProbeLogPath().fileSystemRepresentation, "a");
         if (!file) return;
-        fputs("[VDTProbe] bootstrap dylib-loaded\n", file);
+        fputs("[VDTProbe] loader-entry dylib-initialized\n", file);
         fclose(file);
     } @catch (__unused NSException *exception) {
         // A diagnostic marker must never affect runningboardd.
@@ -194,12 +195,11 @@ static void VDTDiscoverAndHook(void) {
     }
 }
 
-static void VDTProbeInitialize(void) __attribute__((constructor));
-static void VDTProbeInitialize(void) {
+static void VDTProbeInitializeOnce(void) {
     @autoreleasepool {
         // The dylib Filter is the authority for injection scope. Do not make
         // startup depend on NSProcessInfo's private daemon naming behavior.
-        VDTWriteBootstrapMarker();
+        VDTWriteLoaderEntryMarker();
         gLog = os_log_create("com.udevs.vedette.probe", "runningboardd");
         gOriginalIMPs = [NSMutableDictionary dictionary];
         gOriginalLock = dispatch_queue_create("com.udevs.vedette.probe.original-imps", DISPATCH_QUEUE_SERIAL);
@@ -207,4 +207,11 @@ static void VDTProbeInitialize(void) {
         VDTLog(@"[VDTProbe] startup process=runningboardd mode=log-only no-pid-scan no-timer file=/var/mobile/Media/VDTProbe.log");
         VDTDiscoverAndHook();
     }
+}
+
+void VDTProbeInitialize(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        VDTProbeInitializeOnce();
+    });
 }
