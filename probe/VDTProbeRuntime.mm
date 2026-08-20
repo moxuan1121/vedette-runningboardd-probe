@@ -209,7 +209,7 @@ static void VDTProbeInitializeOnce(void) {
     }
 }
 
-void VDTProbeInitialize(void) {
+extern "C" void VDTProbeInitialize(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         VDTProbeInitializeOnce();

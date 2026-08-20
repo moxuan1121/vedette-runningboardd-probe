@@ -9,7 +9,7 @@ INSTALL_TARGET_PROCESSES = runningboardd
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VedetteProbe
-VedetteProbe_FILES = VedetteProbe.xm VedetteProbe.mm
+VedetteProbe_FILES = VedetteProbe.xm VDTProbeRuntime.mm
 VedetteProbe_CFLAGS = -fobjc-arc
 VedetteProbe_FRAMEWORKS = Foundation
 
