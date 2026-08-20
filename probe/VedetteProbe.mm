@@ -2,6 +2,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <roothide.h>
 #import <substrate.h>
 #include <stdio.h>
 
@@ -39,10 +40,28 @@ static NSMutableDictionary<NSString *, NSValue *> *gOriginalIMPs;
 static dispatch_queue_t gOriginalLock;
 static dispatch_queue_t gFileLogQueue;
 static os_log_t gLog;
-// This is deliberately outside the RootHide jbroot. It is a normal, stable
-// mobile-owned path readable from a RootHide terminal without exposing or
-// hardcoding the randomized jailbreak root.
-static const char * const kVDTProbeLogPath = "/var/mobile/Media/VDTProbe.log";
+
+// Explicitly resolve through RootHide. This avoids relying on the current
+// process's path-redirection behavior and never hardcodes a jbroot directory.
+static NSString *VDTProbeLogPath(void) {
+    static NSString *path;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        path = jbroot(@"/var/mobile/Media/VDTProbe.log");
+    });
+    return path;
+}
+
+static void VDTWriteBootstrapMarker(void) {
+    @try {
+        FILE *file = fopen(VDTProbeLogPath().fileSystemRepresentation, "a");
+        if (!file) return;
+        fputs("[VDTProbe] bootstrap dylib-loaded\n", file);
+        fclose(file);
+    } @catch (__unused NSException *exception) {
+        // A diagnostic marker must never affect runningboardd.
+    }
+}
 
 static NSString *VDTStringOrNull(id value) {
     if (!value || value == [NSNull null]) return @"(null)";
@@ -87,11 +106,11 @@ static void VDTLog(NSString *line) {
     }
 
     // iOS RootHide shells do not provide macOS's `log stream` reader. Keep an
-    // independent, append-only file outside jbroot; all file failures are ignored.
+    // independent, append-only file resolved by jbroot; all file failures are ignored.
     dispatch_async(gFileLogQueue, ^{
         @autoreleasepool {
             @try {
-                FILE *file = fopen(kVDTProbeLogPath, "a");
+                FILE *file = fopen(VDTProbeLogPath().fileSystemRepresentation, "a");
                 if (!file) return;
                 NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
                 if (data.length) fwrite(data.bytes, 1, data.length, file);
@@ -178,8 +197,9 @@ static void VDTDiscoverAndHook(void) {
 static void VDTProbeInitialize(void) __attribute__((constructor));
 static void VDTProbeInitialize(void) {
     @autoreleasepool {
-        NSString *processName = [NSProcessInfo processInfo].processName;
-        if (![processName isEqualToString:@"runningboardd"]) return;
+        // The dylib Filter is the authority for injection scope. Do not make
+        // startup depend on NSProcessInfo's private daemon naming behavior.
+        VDTWriteBootstrapMarker();
         gLog = os_log_create("com.udevs.vedette.probe", "runningboardd");
         gOriginalIMPs = [NSMutableDictionary dictionary];
         gOriginalLock = dispatch_queue_create("com.udevs.vedette.probe.original-imps", DISPATCH_QUEUE_SERIAL);
