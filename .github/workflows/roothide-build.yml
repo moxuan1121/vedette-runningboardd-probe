@@ -9,6 +9,7 @@ on:
       - roothide-stable-marker2
       - roothide-no-rb-probe1
       - roothide-stable-probe3
+      - feat/vedette-lite-runningboardd
     paths:
       - '.github/workflows/roothide-build.yml'
       - '**/*.h'

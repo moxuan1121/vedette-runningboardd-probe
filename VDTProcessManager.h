@@ -1,28 +1,14 @@
-//  Copyright (c) 2021 udevs
-//
-//  This file is subject to the terms and conditions defined in
-//  file 'LICENSE', which is part of this source code package.
-
 #import "Common.h"
-
-#include <libproc/libproc.h>
-#include <libproc/libproc_internal.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Thread-safe prefs accessors. Use instead of direct global access.
-void VDTSetPrefs(NSDictionary *newPrefs);
-NSDictionary *VDTGetPrefs(void);
-
-NSArray* pids_with_identifier_and_type(NSArray <NSString *>*identifiers, NSArray <NSNumber *> *types);
-void monitor_pids(NSArray <NSNumber *> *pids, NSArray <NSNumber *> *percentages, NSArray <NSNumber *> *intervals);
-void throttle_pids(NSArray <NSNumber *> *pids, NSArray <NSNumber *> *percentages);
-void received_new_proc(pid_t pid);
-//void restore_all_monitors();
+// All APIs are internally serialized. They are called only by runningboardd.
+void VDTConfigureTargets(NSDictionary *prefs);
+void VDTStartPIDDiscovery(void);
+void VDTStopPIDDiscovery(void);
 
 #ifdef __cplusplus
 }
 #endif
-

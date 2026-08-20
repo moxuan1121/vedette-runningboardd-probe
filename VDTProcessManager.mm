@@ -1,255 +1,161 @@
-//  Copyright (c) 2021 udevs
-//
-//  This file is subject to the terms and conditions defined in
-//  file 'LICENSE', which is part of this source code package.
-
 #import "VDTProcessManager.h"
 #import "VDTShared.h"
-#import "VDTProbe.h"
 #import "PrivateHeaders.h"
 
-#include <os/lock.h>
+#include <libproc/libproc.h>
+#include <libproc/libproc_internal.h>
 
-#pragma mark - Thread-safe prefs storage
+static dispatch_queue_t sQueue;
+static dispatch_source_t sTimer;
+static NSDictionary<NSString *, NSDictionary *> *sAppTargets;
+static NSDictionary<NSString *, NSDictionary *> *sDaemonTargets;
+static NSMutableDictionary<NSNumber *, NSDictionary *> *sMonitored;
+static BOOL sScanPending;
 
-static NSDictionary *_prefs;
-static os_unfair_lock _prefsLock = OS_UNFAIR_LOCK_INIT;
-
-void VDTSetPrefs(NSDictionary *newPrefs){
-    os_unfair_lock_lock(&_prefsLock);
-    _prefs = newPrefs;
-    os_unfair_lock_unlock(&_prefsLock);
-}
-
-NSDictionary *VDTGetPrefs(void){
-    os_unfair_lock_lock(&_prefsLock);
-    NSDictionary *snapshot = _prefs;
-    os_unfair_lock_unlock(&_prefsLock);
-    return snapshot;
-}
-
-#pragma mark - Process helpers
-
-static LSApplicationProxy* appproxy_from_bundle_path(NSString *path){
-    // Use fileURLWithPath to handle jbroot paths with spaces/special chars
-    return [objc_getClass("LSApplicationProxy") applicationProxyForBundleURL:[NSURL fileURLWithPath:path]];
-}
-
-static LSApplicationProxy* appproxy_from_pid(pid_t pid){
-    char pathBuffer[PROC_PIDPATHINFO_MAXSIZE];
-    proc_pidpath(pid, pathBuffer, sizeof(pathBuffer));
-    NSString *possibleBundlePath = [NSString stringWithUTF8String:pathBuffer].stringByDeletingLastPathComponent;
-    return appproxy_from_bundle_path(possibleBundlePath);
-}
-
-static NSString* name_from_pid(pid_t pid){
-    char nameBuffer[256];
-    proc_name(pid, nameBuffer, sizeof(nameBuffer));
-    return [NSString stringWithUTF8String:nameBuffer];
-}
-
-/*
-static NSArray* all_running_pids(){
-    int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    int *buffer = (int *)malloc(sizeof(int)*n);
-    int k = proc_listpids(PROC_ALL_PIDS, 0, buffer, n*sizeof(int));
-    
-    NSMutableArray *pids = [NSMutableArray array];
-    for (int i = 0; i < k; i++) {
-        int pid = buffer[i];
-        if (pid == 0) continue;
-        [pids addObject:@(pid)];
+static void VDTApplyPolicy(pid_t pid, NSDictionary *rule) {
+    if (pid <= 0 || !rule) return;
+    NSUInteger policy = [rule[@"policy"] unsignedIntegerValue];
+    int percentage = [rule[@"percentage"] intValue];
+    int interval = [rule[@"interval"] intValue];
+    if (policy == VDTViolationPolicyMonitorAndTerminate) {
+        proc_disable_cpumon(pid);
+        if (percentage > 0 && interval > 0) proc_set_cpumon_params_fatal(pid, percentage, interval);
+        else proc_set_cpumon_defaults(pid);
+        proc_resume_cpumon(pid);
+    } else if (policy == VDTViolationPolicyThrottle) {
+        if (percentage > 0) proc_setcpu_percentage(pid, PROC_SETCPU_ACTION_THROTTLE, percentage);
+        else proc_clear_cpulimits(pid);
     }
-    return pids;
 }
-*/
 
-#pragma mark - PID lookup (optimized)
+static void VDTClearPolicy(pid_t pid, NSDictionary *rule) {
+    if (pid <= 0 || !rule) return;
+    if ([rule[@"policy"] unsignedIntegerValue] == VDTViolationPolicyThrottle) proc_clear_cpulimits(pid);
+    else {
+        proc_disable_cpumon(pid);
+        proc_set_cpumon_defaults(pid);
+        proc_resume_cpumon(pid);
+    }
+}
 
-NSArray* pids_with_identifier_and_type(NSArray <NSString *>*identifiers, NSArray <NSNumber *> *types){
-    if (!identifiers.count) return @[];
+static NSDictionary *VDTRule(NSDictionary *config) {
+    NSUInteger policy = [config[@"violationPolicy"] unsignedIntegerValue];
+    if (policy != VDTViolationPolicyMonitorAndTerminate && policy != VDTViolationPolicyThrottle) return nil;
+    return @{@"policy": @(policy), @"percentage": @([config[@"percentage"] intValue] ?: 80), @"interval": @([config[@"interval"] intValue] ?: 120)};
+}
 
-    // Pre-compute which lookup types we need to avoid unnecessary work
-    BOOL needsAppLookup = NO;
-    BOOL needsDaemonLookup = NO;
-    NSMutableSet *daemonNameSet = [NSMutableSet set];
-    NSMutableSet *appBundleIdSet = [NSMutableSet set];
+static NSString *VDTDaemonName(pid_t pid) {
+    char buffer[256] = {0};
+    return proc_name(pid, buffer, sizeof(buffer)) > 0 ? [NSString stringWithUTF8String:buffer] : nil;
+}
 
-    for (NSUInteger idx = 0; idx < identifiers.count; idx++){
-        if ([types[idx] unsignedLongValue] == VDTConfigTypeApp){
-            needsAppLookup = YES;
-            [appBundleIdSet addObject:identifiers[idx]];
-        }else{
-            needsDaemonLookup = YES;
-            [daemonNameSet addObject:identifiers[idx]];
+static NSString *VDTAppBundleIdentifier(pid_t pid, NSString **executableOut) {
+    char buffer[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(pid, buffer, sizeof(buffer)) <= 0) return nil;
+    NSString *path = [NSString stringWithUTF8String:buffer];
+    if (!path.length) return nil;
+    if (executableOut) *executableOut = path;
+    LSApplicationProxy *proxy = [objc_getClass("LSApplicationProxy") applicationProxyForBundleURL:[NSURL fileURLWithPath:[path stringByDeletingLastPathComponent]]];
+    return proxy.bundleIdentifier;
+}
+
+static void VDTArmTimer(NSTimeInterval seconds) {
+    if (!sTimer) return;
+    dispatch_source_set_timer(sTimer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)), DISPATCH_TIME_FOREVER, (uint64_t)(seconds * NSEC_PER_SEC * 0.1));
+}
+
+static void VDTScan(void) {
+    sScanPending = NO;
+    if (!sAppTargets.count && !sDaemonTargets.count) return;
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (bytes <= 0) { VDTArmTimer(10); return; }
+    int *pids = calloc(1, (size_t)bytes);
+    int count = pids ? proc_listpids(PROC_ALL_PIDS, 0, pids, bytes) : 0;
+    NSMutableSet *live = [NSMutableSet set];
+    BOOL foundTarget = NO;
+    for (int index = 0; index < count; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 0) continue;
+        NSDictionary *rule = nil;
+        NSString *identity = nil;
+        NSString *daemon = sDaemonTargets.count ? VDTDaemonName(pid) : nil;
+        if (daemon) { rule = sDaemonTargets[daemon]; identity = [@"d:" stringByAppendingString:daemon]; }
+        if (!rule && sAppTargets.count) {
+            NSString *executable = nil;
+            NSString *bundleID = VDTAppBundleIdentifier(pid, &executable);
+            if (bundleID) { rule = sAppTargets[bundleID]; identity = [@"a:" stringByAppendingString:bundleID]; }
+        }
+        if (!rule || !identity) continue;
+        foundTarget = YES;
+        NSNumber *key = @(pid);
+        [live addObject:key];
+        NSDictionary *previous = sMonitored[key];
+        // Matching identity is re-established every scan before either reuse or skip.
+        if (previous && [previous[@"identity"] isEqualToString:identity]) continue;
+        if (previous) VDTClearPolicy(pid, previous[@"rule"]);
+        VDTApplyPolicy(pid, rule);
+        sMonitored[key] = @{@"identity": identity, @"rule": rule};
+    }
+    if (pids) free(pids);
+    for (NSNumber *pid in sMonitored.allKeys.copy) {
+        if (![live containsObject:pid]) {
+            NSDictionary *entry = sMonitored[pid];
+            VDTClearPolicy(pid.intValue, entry[@"rule"]);
+            [sMonitored removeObjectForKey:pid];
         }
     }
+    VDTArmTimer(foundTarget ? 5 : 10);
+}
 
-    int n = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    int *buffer = (int *)malloc(sizeof(int)*n);
-    int k = proc_listpids(PROC_ALL_PIDS, 0, buffer, n*sizeof(int));
-    
-    NSMutableArray *pids = [NSMutableArray array];
-    for (int i = 0; i < k; i++) {
-        int pid = buffer[i];
-        if (pid == 0) continue;
-        
-        BOOL matched = NO;
+static void VDTScheduleScanNow(void) {
+    if (!sTimer || sScanPending) return;
+    sScanPending = YES;
+    dispatch_async(sQueue, ^{ VDTScan(); });
+}
 
-        // Try daemon name match first (cheap: only proc_name syscall)
-        if (needsDaemonLookup && !matched){
-            NSString *daemonName = name_from_pid(pid);
-            if ([daemonNameSet containsObject:daemonName]){
-                [pids addObject:@(pid)];
-                matched = YES;
-            }
+void VDTConfigureTargets(NSDictionary *prefs) {
+    dispatch_async(sQueue, ^{
+        for (NSNumber *pid in sMonitored.allKeys.copy) VDTClearPolicy(pid.intValue, sMonitored[pid][@"rule"]);
+        [sMonitored removeAllObjects];
+        NSMutableDictionary *apps = [NSMutableDictionary dictionary], *daemons = [NSMutableDictionary dictionary];
+        BOOL enabled = [prefs[@"enabled"] boolValue];
+        if (enabled) {
+            for (NSDictionary *config in prefs[@"appConfigs"]) { NSString *key = config[@"bundleIdentifier"]; NSDictionary *rule = [config[@"enabled"] boolValue] ? VDTRule(config) : nil; if (key.length && rule) apps[key] = rule; }
+            for (NSDictionary *config in prefs[@"daemonConfigs"]) { NSString *key = config[@"daemonName"]; NSDictionary *rule = [config[@"enabled"] boolValue] ? VDTRule(config) : nil; if (key.length && rule) daemons[key] = rule; }
         }
-
-        // Only do expensive app proxy lookup if we have app identifiers to match
-        if (needsAppLookup && !matched){
-            LSApplicationProxy *appProxy = appproxy_from_pid(pid);
-            if (appProxy.bundleIdentifier && [appBundleIdSet containsObject:appProxy.bundleIdentifier]){
-                [pids addObject:@(pid)];
-                matched = YES;
-            }
+        sAppTargets = [apps copy]; sDaemonTargets = [daemons copy];
+        if (!sAppTargets.count && !sDaemonTargets.count) {
+            sScanPending = NO;
+            if (sTimer) { dispatch_source_cancel(sTimer); sTimer = nil; }
+            return;
         }
-    }
-    if (buffer) free(buffer);
-    VDTProbeRecord(@"runningboardd.pidLookup", @{
-        @"identifiers": identifiers ?: @[],
-        @"types": types ?: @[],
-        @"matchedPids": pids ?: @[]
+        if (!sTimer) {
+            sTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sQueue);
+            dispatch_source_set_event_handler(sTimer, ^{ VDTScan(); });
+            dispatch_resume(sTimer);
+        }
+        VDTScheduleScanNow();
     });
-    return pids; // only existing pids are returned
 }
 
-#pragma mark - Monitor / throttle
-
-void monitor_pids(NSArray <NSNumber *> *pids, NSArray <NSNumber *> *percentages, NSArray <NSNumber *> *intervals){
-    
-    for (NSUInteger idx = 0; idx < pids.count; idx++){
-        pid_t pid = [pids[idx] intValue];
-        if (pid > 0){
-            int percentage = [percentages[idx] intValue];
-            int interval = [intervals[idx] intValue];
-            int disableRet = proc_disable_cpumon(pid);
-            int setRet = -999;
-            int resumeRet = -999;
-            
-            if (percentage > 0 && interval > 0){
-                setRet = proc_set_cpumon_params_fatal(pid, percentage, interval);
-                if (setRet == 0){
-                    HBLogDebug(@"Monitoring pid %d with percentage %d%% and interval %ds", pid, percentage, interval);
-                }
-            }else{
-                setRet = proc_set_cpumon_defaults(pid);
-                if (setRet == 0){
-                    HBLogDebug(@"Restore CPU limits for pid: %d", pid);
-                }
-            }
-            
-            resumeRet = proc_resume_cpumon(pid);
-            
-            VDTProbeRecord(@"runningboardd.monitorSyscall", @{
-                @"pid": @(pid),
-                @"name": name_from_pid(pid) ?: @"",
-                @"percentage": @(percentage),
-                @"interval": @(interval),
-                @"disableRet": @(disableRet),
-                @"setRet": @(setRet),
-                @"resumeRet": @(resumeRet)
-            });
-        }
-    }
-}
-
-void throttle_pids(NSArray <NSNumber *> *pids, NSArray <NSNumber *> *percentages){
-    
-    for (NSUInteger idx = 0; idx < pids.count; idx++){
-        pid_t pid = [pids[idx] intValue];
-        if (pid > 0){
-            int percentage = [percentages[idx] intValue];
-            int setRet = 0;
-            int clearRet = 0;
-            
-            if (percentage > 0){
-                errno = 0;
-                setRet = proc_setcpu_percentage(pid, PROC_SETCPU_ACTION_THROTTLE, percentage);
-                if (setRet == 0){
-                    HBLogDebug(@"Throttled pid %d with percentage %d%% ", pid, percentage);
-                }
-            }else{
-                errno = 0;
-                clearRet = proc_clear_cpulimits(pid);
-                if (clearRet == 0){
-                    HBLogDebug(@"Restored CPU limits for pid %d ", pid);
-                }
-            }
-            
-            VDTProbeRecord(@"runningboardd.throttleSyscall", @{
-                @"pid": @(pid),
-                @"name": name_from_pid(pid) ?: @"",
-                @"requestedPercentage": @(percentage),
-                @"setRet": @(setRet),
-                @"setErrno": @(errno),
-                @"clearRet": @(clearRet)
-            });
-        }
-    }
-}
-
-#pragma mark - New process handler
-
-void received_new_proc(pid_t pid){
-    // Snapshot prefs for thread safety
-    NSDictionary *localPrefs = VDTGetPrefs();
-    
-    int percentage = 80;
-    int interval = 120;
-    
-    LSApplicationProxy *appProxy = appproxy_from_pid(pid);
-    VDTViolationPolicy violationPolicy = VDTViolationPolicyMonitorAndTerminate;
-    
-    if (appProxy.bundleIdentifier){ //isApplication
-        percentage = [valueForProcessConfigKeyWithPrefs(appProxy.bundleIdentifier, @"percentage", @80, VDTConfigTypeApp, localPrefs) intValue];
-        interval = [valueForProcessConfigKeyWithPrefs(appProxy.bundleIdentifier, @"interval", @120, VDTConfigTypeApp, localPrefs) intValue];
-        violationPolicy = (VDTViolationPolicy)[valueForProcessConfigKeyWithPrefs(appProxy.bundleIdentifier, @"violationPolicy", @(VDTViolationPolicyMonitorAndTerminate), VDTConfigTypeApp, localPrefs) unsignedLongValue];
-    }else{ //isDaemon
-        NSString *daemonName = name_from_pid(pid);
-        percentage = [valueForProcessConfigKeyWithPrefs(daemonName, @"percentage", @80, VDTConfigTypeDaemon, localPrefs) intValue];
-        interval = [valueForProcessConfigKeyWithPrefs(daemonName, @"interval", @120, VDTConfigTypeDaemon, localPrefs) intValue];
-        violationPolicy = (VDTViolationPolicy)[valueForProcessConfigKeyWithPrefs(daemonName, @"violationPolicy", @(VDTViolationPolicyMonitorAndTerminate), VDTConfigTypeDaemon, localPrefs) unsignedLongValue];
-
-    }
-    
-    VDTProbeRecord(@"runningboardd.receivedNewProcResolved", @{
-        @"pid": @(pid),
-        @"name": name_from_pid(pid) ?: @"",
-        @"bundleIdentifier": appProxy.bundleIdentifier ?: @"",
-        @"percentage": @(percentage),
-        @"interval": @(interval),
-        @"violationPolicy": @(violationPolicy)
+void VDTStartPIDDiscovery(void) {
+    dispatch_async(sQueue, ^{
+        if (sTimer || (!sAppTargets.count && !sDaemonTargets.count)) return;
+        sTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sQueue);
+        dispatch_source_set_event_handler(sTimer, ^{ VDTScan(); });
+        dispatch_resume(sTimer);
     });
-    
-    switch (violationPolicy) {
-        case VDTViolationPolicyMonitorAndTerminate:
-            monitor_pids(@[@(pid)], @[@(percentage)], @[@(interval)]);
-            break;
-        case VDTViolationPolicyThrottle:
-            throttle_pids(@[@(pid)], @[@(percentage)]);
-            break;
-        default:
-            break;
-    }
 }
 
-/*
-void restore_all_monitors(){
-    NSArray *pids = all_running_pids();
-    NSMutableArray *zerosArray = [NSMutableArray array];
-    for (NSUInteger idx = 0; idx < pids.count; idx++){
-        [zerosArray addObject:@0];
-    }
-    monitor_pids(pids, zerosArray, zerosArray);
+void VDTStopPIDDiscovery(void) {
+    dispatch_async(sQueue, ^{
+        sScanPending = NO;
+        if (sTimer) { dispatch_source_cancel(sTimer); sTimer = nil; }
+    });
 }
-*/
+
+__attribute__((constructor)) static void VDTManagerInit(void) {
+    sQueue = dispatch_queue_create("com.udevs.vedette.pid-discovery", DISPATCH_QUEUE_SERIAL);
+    sMonitored = [NSMutableDictionary dictionary];
+    sAppTargets = @{}; sDaemonTargets = @{};
+}
