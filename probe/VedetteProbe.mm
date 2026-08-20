@@ -90,7 +90,7 @@ static IMP VDTOriginalIMP(Class cls, SEL selector) {
         // A superclass hook can be invoked on a private subclass. Walk upward so
         // the original IMP is always recovered rather than suppressing behavior.
         for (Class current = cls; current && !result; current = class_getSuperclass(current)) {
-            result = (IMP)[gOriginalIMPs[VDTKey(current, selector)] pointerValue];
+            result = (IMP)(uintptr_t)[gOriginalIMPs[VDTKey(current, selector)] pointerValue];
         }
     });
     return result;
@@ -146,13 +146,14 @@ static void VDTDiscoverAndHook(void) {
             continue;
         }
         dispatch_sync(gOriginalLock, ^{
-            gOriginalIMPs[VDTKey(cls, selector)] = [NSValue valueWithPointer:original];
+            gOriginalIMPs[VDTKey(cls, selector)] = [NSValue valueWithPointer:(const void *)(uintptr_t)original];
         });
         VDTLog([NSString stringWithFormat:@"[VDTProbe] discovery class=%s selector=%s hookResult=installed", candidate.className, candidate.selectorName]);
     }
 }
 
-%ctor {
+static void VDTProbeInitialize(void) __attribute__((constructor));
+static void VDTProbeInitialize(void) {
     @autoreleasepool {
         NSString *processName = [NSProcessInfo processInfo].processName;
         if (![processName isEqualToString:@"runningboardd"]) return;
