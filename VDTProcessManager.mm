@@ -12,6 +12,16 @@ static NSDictionary<NSString *, NSDictionary *> *sDaemonTargets;
 static NSMutableDictionary<NSNumber *, NSDictionary *> *sMonitored;
 static BOOL sScanPending;
 
+static void VDTEnsureState(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sQueue = dispatch_queue_create("com.udevs.vedette.pid-discovery", DISPATCH_QUEUE_SERIAL);
+        sMonitored = [NSMutableDictionary dictionary];
+        sAppTargets = @{};
+        sDaemonTargets = @{};
+    });
+}
+
 static void VDTApplyPolicy(pid_t pid, NSDictionary *rule) {
     if (pid <= 0 || !rule) return;
     NSUInteger policy = [rule[@"policy"] unsignedIntegerValue];
@@ -114,6 +124,7 @@ static void VDTScheduleScanNow(void) {
 }
 
 void VDTConfigureTargets(NSDictionary *prefs) {
+    VDTEnsureState();
     dispatch_async(sQueue, ^{
         for (NSNumber *pid in sMonitored.allKeys.copy) VDTClearPolicy(pid.intValue, sMonitored[pid][@"rule"]);
         [sMonitored removeAllObjects];
@@ -139,6 +150,7 @@ void VDTConfigureTargets(NSDictionary *prefs) {
 }
 
 void VDTStartPIDDiscovery(void) {
+    VDTEnsureState();
     dispatch_async(sQueue, ^{
         if (sTimer || (!sAppTargets.count && !sDaemonTargets.count)) return;
         sTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, sQueue);
@@ -148,14 +160,9 @@ void VDTStartPIDDiscovery(void) {
 }
 
 void VDTStopPIDDiscovery(void) {
+    VDTEnsureState();
     dispatch_async(sQueue, ^{
         sScanPending = NO;
         if (sTimer) { dispatch_source_cancel(sTimer); sTimer = nil; }
     });
-}
-
-__attribute__((constructor)) static void VDTManagerInit(void) {
-    sQueue = dispatch_queue_create("com.udevs.vedette.pid-discovery", DISPATCH_QUEUE_SERIAL);
-    sMonitored = [NSMutableDictionary dictionary];
-    sAppTargets = @{}; sDaemonTargets = @{};
 }
