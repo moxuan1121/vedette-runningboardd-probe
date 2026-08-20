@@ -1,0 +1,9 @@
+Package: com.udevs.vedette.runningboardd-probe
+Name: Vedette RunningBoardd Probe
+Version: 0.1.0
+Architecture: iphoneos-arm64e
+Description: iOS 15 runningboardd process-registration hook probe for Vedette research
+Maintainer: moxuan1121
+Author: moxuan1121
+Section: Tweaks
+Depends: roothide, mobilesubstrate (>= 0.9.5000)

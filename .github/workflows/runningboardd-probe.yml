@@ -1,0 +1,62 @@
+name: Build Vedette RunningBoardd Probe (RootHide)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - probe/ios15-runningboardd-entry
+    paths:
+      - 'probe/**'
+      - '.github/workflows/runningboardd-probe.yml'
+
+jobs:
+  package:
+    name: Package RootHide arm64e Probe
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      THEOS_PACKAGE_SCHEME: roothide
+      FINALPACKAGE: 1
+      PREFIX: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install packaging tools
+        run: |
+          brew update
+          brew install dpkg ldid make
+
+      - name: Install RootHide Theos
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          git -C "$THEOS" checkout --detach 88506b2c22e9e07dd4ed055f23c9e398a117a2c7
+
+      - name: Install iPhoneOS 16.5 SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/theos-sdks
+          git -C /tmp/theos-sdks checkout --detach 0222fd5413cf4b9af096f37b4621afa2688572f7
+          git -C /tmp/theos-sdks sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$THEOS/sdks"
+          cp -R /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Build standalone log-only probe
+        run: |
+          export PATH="/opt/homebrew/opt/make/libexec/gnubin:$THEOS/bin:$PATH"
+          make -C probe clean SDKVERSION=16.5
+          make -C probe package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide SDKVERSION=16.5
+
+      - name: Verify package metadata
+        run: |
+          test -s probe/packages/*.deb
+          dpkg-deb -f probe/packages/*.deb Package Version Architecture
+
+      - name: Upload RootHide probe deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: vedette-runningboardd-probe-roothide-arm64e
+          path: probe/packages/*.deb
+          if-no-files-found: error
